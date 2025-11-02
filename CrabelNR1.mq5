@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                   CrabelNR1.mq5 |
 //|                        Toby Crabel Narrow Range 1 Strategy       |
-//|                                      Runs on D1 (Daily) chart    |
+//|                                      Runs on any timeframe       |
 //+------------------------------------------------------------------+
 #property copyright "Toby Crabel NR1 Strategy"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 // Input Parameters
@@ -12,13 +12,10 @@ input group "=== Strategy Parameters ==="
 input int      inp_LookbackPeriod = 20;        // Lookback Period (days)
 input int      inp_StretchLength = 10;         // Stretch Length for Noise calculation
 input double   inp_StretchMultiple = 2.0;      // Stretch Multiple
-input int      inp_ATRLength = 20;             // ATR Length
-input double   inp_ATRStopMultiple = 6.0;      // ATR Stop Multiple
 
 input group "=== Exit Parameters ==="
 input int      inp_TimeExitDays = 5;           // Time Exit (days, 0=disabled)
 input double   inp_TargetMultiple = 3.0;       // Target Exit Multiple (0=disabled)
-input bool     inp_UseStretchExit = true;      // Use Stretch Exit (opposite side)
 
 input group "=== Risk Management ==="
 input double   inp_RiskPercent = 1.0;          // Risk per Trade (%)
@@ -26,36 +23,21 @@ input int      inp_MagicNumber = 20241102;     // Magic Number
 input string   inp_TradeComment = "CrabelNR1"; // Trade Comment
 
 // Global variables
-int      g_atrHandle = INVALID_HANDLE;
-double   g_atrBuffer[];
 datetime g_lastBarTime = 0;
 bool     g_newBar = false;
 datetime g_entryTime = 0;
+ulong    g_buyStopTicket = 0;
+ulong    g_sellStopTicket = 0;
+double   g_initialStretch = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Check if chart is Daily
-   if(_Period != PERIOD_D1)
-   {
-      Alert("ERROR: This EA must run on D1 (Daily) chart!");
-      return(INIT_FAILED);
-   }
-
-   // Initialize ATR indicator
-   g_atrHandle = iATR(_Symbol, PERIOD_D1, inp_ATRLength);
-   if(g_atrHandle == INVALID_HANDLE)
-   {
-      Print("Failed to create ATR indicator");
-      return(INIT_FAILED);
-   }
-
-   ArraySetAsSeries(g_atrBuffer, true);
-
-   Print("Toby Crabel NR1 EA initialized on ", _Symbol, " D1");
+   Print("Toby Crabel NR1 EA v2.0 initialized on ", _Symbol, " ", EnumToString((ENUM_TIMEFRAMES)_Period));
    Print("Lookback: ", inp_LookbackPeriod, " | Stretch: ", inp_StretchLength, "x", inp_StretchMultiple);
+   Print("LOGIC: First triggered order = Entry, Second order = Protective Stop");
 
    return(INIT_SUCCEEDED);
 }
@@ -65,8 +47,6 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_atrHandle != INVALID_HANDLE)
-      IndicatorRelease(g_atrHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -80,27 +60,20 @@ void OnTick()
    if(!g_newBar)
       return;
 
-   // Update ATR values
-   if(CopyBuffer(g_atrHandle, 0, 0, 3, g_atrBuffer) < 3)
-      return;
+   // Manage existing positions and orders
+   ManagePositionsAndOrders();
 
-   // Check and manage existing positions
-   ManageOpenPositions();
-
-   // Check if we can open new trade (only count our positions)
-   if(CountOwnPositions() > 0)
+   // Check if we already have pending orders or open position
+   if(CountOwnPositions() > 0 || CountOwnPendingOrders() > 0)
       return;
 
    // Check for Narrow Range pattern
    if(IsNarrowRange())
    {
-      // Delete old pending orders only when we have a new signal
-      DeletePendingOrders();
-
       double stretch = CalculateStretch();
       if(stretch > 0)
       {
-         PlacePendingOrders(stretch);
+         PlaceBracketOrders(stretch);
       }
    }
 }
@@ -110,7 +83,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 void CheckNewBar()
 {
-   datetime currentBarTime = iTime(_Symbol, PERIOD_D1, 0);
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
 
    if(currentBarTime != g_lastBarTime)
    {
@@ -124,7 +97,104 @@ void CheckNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| Count own positions (with our Magic Number)                       |
+//| Manage positions and pending orders                               |
+//+------------------------------------------------------------------+
+void ManagePositionsAndOrders()
+{
+   // Check if we have an open position
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber) continue;
+
+      // Store entry time
+      if(g_entryTime == 0)
+         g_entryTime = (datetime)PositionGetInteger(POSITION_TIME);
+
+      // Check time exit
+      if(inp_TimeExitDays > 0)
+      {
+         datetime currentTime = TimeCurrent();
+         int daysPassed = (int)((currentTime - g_entryTime) / 86400);
+
+         if(daysPassed >= inp_TimeExitDays)
+         {
+            ClosePosition(ticket, "Time Exit");
+            DeleteAllOwnPendingOrders();
+            ResetGlobals();
+            continue;
+         }
+      }
+
+      // Check target exit
+      if(inp_TargetMultiple > 0 && g_initialStretch > 0)
+      {
+         double positionProfit = PositionGetDouble(POSITION_PROFIT);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPrice = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ?
+                               SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                               SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+         double priceMove = MathAbs(currentPrice - openPrice);
+         double targetDistance = g_initialStretch * inp_TargetMultiple;
+
+         if(priceMove >= targetDistance)
+         {
+            ClosePosition(ticket, "Target Exit");
+            DeleteAllOwnPendingOrders();
+            ResetGlobals();
+            continue;
+         }
+      }
+   }
+
+   // Reset globals if no position
+   if(CountOwnPositions() == 0)
+   {
+      g_entryTime = 0;
+   }
+
+   // Check if one pending order was triggered (position opened)
+   // Then the other pending order becomes the protective stop
+   if(CountOwnPositions() > 0)
+   {
+      // We have a position now, check which order was triggered
+      CheckAndConvertPendingToStop();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check which pending order was triggered and convert other to SL  |
+//+------------------------------------------------------------------+
+void CheckAndConvertPendingToStop()
+{
+   // Check if we still have pending orders
+   if(CountOwnPendingOrders() == 0)
+      return;
+
+   // Get the position type
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong posTicket = PositionGetTicket(i);
+      if(posTicket <= 0) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber) continue;
+
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      // Delete opposite pending orders - they will be replaced by proper SL
+      // The SL is already set on the position from the initial bracket order
+      DeleteAllOwnPendingOrders();
+      break;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count own positions                                               |
 //+------------------------------------------------------------------+
 int CountOwnPositions()
 {
@@ -132,15 +202,26 @@ int CountOwnPositions()
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0)
-         continue;
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber) continue;
+      count++;
+   }
+   return count;
+}
 
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber)
-         continue;
-
+//+------------------------------------------------------------------+
+//| Count own pending orders                                          |
+//+------------------------------------------------------------------+
+int CountOwnPendingOrders()
+{
+   int count = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket <= 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != inp_MagicNumber) continue;
       count++;
    }
    return count;
@@ -151,25 +232,24 @@ int CountOwnPositions()
 //+------------------------------------------------------------------+
 bool IsNarrowRange()
 {
-   // Need at least lookback + 2 bars
-   if(Bars(_Symbol, PERIOD_D1) < inp_LookbackPeriod + 2)
+   if(Bars(_Symbol, PERIOD_CURRENT) < inp_LookbackPeriod + 2)
       return false;
 
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   if(CopyRates(_Symbol, PERIOD_D1, 0, inp_LookbackPeriod + 2, rates) < inp_LookbackPeriod + 2)
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, inp_LookbackPeriod + 2, rates) < inp_LookbackPeriod + 2)
       return false;
 
-   // Calculate 2-bar range for bars 0 and 1 (current forming bar and previous)
-   double currentHigh = MathMax(rates[0].high, rates[1].high);
-   double currentLow = MathMin(rates[0].low, rates[1].low);
+   // Calculate 2-bar range for the completed bars (1 and 2, not including current forming bar 0)
+   double currentHigh = MathMax(rates[1].high, rates[2].high);
+   double currentLow = MathMin(rates[1].low, rates[2].low);
    double currentRange = currentHigh - currentLow;
 
-   // Compare with all 2-bar ranges in lookback period
+   // Compare with all previous 2-bar ranges in lookback period
    bool isNarrowest = true;
 
-   for(int i = 2; i < inp_LookbackPeriod + 1; i++)
+   for(int i = 2; i < inp_LookbackPeriod; i++)
    {
       double high2bar = MathMax(rates[i].high, rates[i+1].high);
       double low2bar = MathMin(rates[i].low, rates[i+1].low);
@@ -198,12 +278,11 @@ double CalculateStretch()
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
 
-   if(CopyRates(_Symbol, PERIOD_D1, 1, inp_StretchLength, rates) < inp_StretchLength)
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 1, inp_StretchLength, rates) < inp_StretchLength)
       return 0;
 
    double noiseSum = 0;
 
-   // Calculate average noise (High - Low) over stretch period
    for(int i = 0; i < inp_StretchLength; i++)
    {
       double noise = rates[i].high - rates[i].low;
@@ -217,54 +296,59 @@ double CalculateStretch()
 }
 
 //+------------------------------------------------------------------+
-//| Place pending orders for breakout                                 |
+//| Place bracket orders (Buy Stop and Sell Stop)                     |
+//| The first triggered = Entry, the second = Protective Stop         |
 //+------------------------------------------------------------------+
-void PlacePendingOrders(double stretch)
+void PlaceBracketOrders(double stretch)
 {
-   double currentOpen = iOpen(_Symbol, PERIOD_D1, 0);
-   double atr = g_atrBuffer[0];
+   double currentOpen = iOpen(_Symbol, PERIOD_CURRENT, 0);
 
-   if(currentOpen <= 0 || atr <= 0)
+   if(currentOpen <= 0)
       return;
 
    // Calculate entry levels
    double buyStopPrice = currentOpen + stretch;
    double sellStopPrice = currentOpen - stretch;
 
-   // Calculate position size based on ATR stop
-   double stopDistance = atr * inp_ATRStopMultiple;
-   double lotSize = CalculateLotSize(stopDistance);
+   // Calculate position size based on stretch distance (= initial risk)
+   double lotSize = CalculateLotSize(stretch);
 
    if(lotSize <= 0)
       return;
 
-   // Calculate stop loss levels
-   double buyStopLoss = buyStopPrice - stopDistance;
-   double sellStopLoss = sellStopPrice + stopDistance;
+   // Store stretch for later use
+   g_initialStretch = stretch;
 
-   // Calculate take profit levels (if enabled)
+   // Place bracket orders
+   // Buy Stop with SL at Sell Stop level, Sell Stop with SL at Buy Stop level
+   // This implements: "The first stop that is traded is the position. The other stop is the protective stop."
+
    double buyTP = 0;
    double sellTP = 0;
 
    if(inp_TargetMultiple > 0)
    {
-      buyTP = buyStopPrice + (stopDistance * inp_TargetMultiple);
-      sellTP = sellStopPrice - (stopDistance * inp_TargetMultiple);
+      buyTP = buyStopPrice + (stretch * inp_TargetMultiple);
+      sellTP = sellStopPrice - (stretch * inp_TargetMultiple);
    }
 
-   // Place Buy Stop order
-   if(PlaceOrder(ORDER_TYPE_BUY_STOP, buyStopPrice, buyStopLoss, buyTP, lotSize))
+   // Place Buy Stop with SL at Sell Stop price
+   g_buyStopTicket = PlaceOrder(ORDER_TYPE_BUY_STOP, buyStopPrice, sellStopPrice, buyTP, lotSize);
+
+   if(g_buyStopTicket > 0)
    {
       Print("Buy Stop placed at ", DoubleToString(buyStopPrice, _Digits),
-            " | SL: ", DoubleToString(buyStopLoss, _Digits),
+            " | Protective Stop: ", DoubleToString(sellStopPrice, _Digits),
             " | Stretch: ", DoubleToString(stretch/_Point, 1), " points");
    }
 
-   // Place Sell Stop order
-   if(PlaceOrder(ORDER_TYPE_SELL_STOP, sellStopPrice, sellStopLoss, sellTP, lotSize))
+   // Place Sell Stop with SL at Buy Stop price
+   g_sellStopTicket = PlaceOrder(ORDER_TYPE_SELL_STOP, sellStopPrice, buyStopPrice, sellTP, lotSize);
+
+   if(g_sellStopTicket > 0)
    {
       Print("Sell Stop placed at ", DoubleToString(sellStopPrice, _Digits),
-            " | SL: ", DoubleToString(sellStopLoss, _Digits),
+            " | Protective Stop: ", DoubleToString(buyStopPrice, _Digits),
             " | Stretch: ", DoubleToString(stretch/_Point, 1), " points");
    }
 }
@@ -299,7 +383,7 @@ double CalculateLotSize(double stopDistance)
 //+------------------------------------------------------------------+
 //| Place order                                                        |
 //+------------------------------------------------------------------+
-bool PlaceOrder(ENUM_ORDER_TYPE orderType, double price, double sl, double tp, double lots)
+ulong PlaceOrder(ENUM_ORDER_TYPE orderType, double price, double sl, double tp, double lots)
 {
    MqlTradeRequest request = {};
    MqlTradeResult result = {};
@@ -314,99 +398,41 @@ bool PlaceOrder(ENUM_ORDER_TYPE orderType, double price, double sl, double tp, d
    request.deviation = 10;
    request.magic = inp_MagicNumber;
    request.comment = inp_TradeComment;
-   request.type_filling = ORDER_FILLING_FOK;
+   request.type_filling = ORDER_FILLING_RETURN;
 
-   // Try different filling modes
    if(!OrderSend(request, result))
    {
-      request.type_filling = ORDER_FILLING_IOC;
+      request.type_filling = ORDER_FILLING_FOK;
       if(!OrderSend(request, result))
       {
-         request.type_filling = ORDER_FILLING_RETURN;
+         request.type_filling = ORDER_FILLING_IOC;
          OrderSend(request, result);
       }
    }
 
    if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED)
    {
-      return true;
+      return result.order;
    }
    else
    {
       Print("Order failed: ", result.retcode, " - ", result.comment);
-      return false;
+      return 0;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Manage open positions                                             |
+//| Delete all own pending orders                                     |
 //+------------------------------------------------------------------+
-void ManageOpenPositions()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0)
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber)
-         continue;
-
-      // Store entry time when position opens
-      if(g_entryTime == 0)
-      {
-         g_entryTime = (datetime)PositionGetInteger(POSITION_TIME);
-      }
-
-      // Check time exit
-      if(inp_TimeExitDays > 0)
-      {
-         datetime currentTime = TimeCurrent();
-         int daysPassed = (int)((currentTime - g_entryTime) / 86400);
-
-         if(daysPassed >= inp_TimeExitDays)
-         {
-            ClosePosition(ticket, "Time Exit");
-            continue;
-         }
-      }
-
-      // Stretch exit (opposite side stop) is handled by initial SL
-      // Additional exit logic can be added here
-   }
-
-   // Delete opposite pending order when one is triggered
-   if(PositionsTotal() > 0)
-   {
-      DeletePendingOrders();
-   }
-
-   // Reset entry time when no positions
-   if(PositionsTotal() == 0)
-   {
-      g_entryTime = 0;
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Delete pending orders                                              |
-//+------------------------------------------------------------------+
-void DeletePendingOrders()
+void DeleteAllOwnPendingOrders()
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
-      if(ticket <= 0)
-         continue;
+      if(ticket <= 0) continue;
 
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-
-      if(OrderGetInteger(ORDER_MAGIC) != inp_MagicNumber)
-         continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != inp_MagicNumber) continue;
 
       MqlTradeRequest request = {};
       MqlTradeResult result = {};
@@ -416,6 +442,9 @@ void DeletePendingOrders()
 
       OrderSend(request, result);
    }
+
+   g_buyStopTicket = 0;
+   g_sellStopTicket = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -443,14 +472,14 @@ void ClosePosition(ulong ticket, string reason)
                    SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                    SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-   request.type_filling = ORDER_FILLING_FOK;
+   request.type_filling = ORDER_FILLING_RETURN;
 
    if(!OrderSend(request, result))
    {
-      request.type_filling = ORDER_FILLING_IOC;
+      request.type_filling = ORDER_FILLING_FOK;
       if(!OrderSend(request, result))
       {
-         request.type_filling = ORDER_FILLING_RETURN;
+         request.type_filling = ORDER_FILLING_IOC;
          OrderSend(request, result);
       }
    }
@@ -459,5 +488,16 @@ void ClosePosition(ulong ticket, string reason)
    {
       Print("Position closed: ", reason);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Reset global variables                                            |
+//+------------------------------------------------------------------+
+void ResetGlobals()
+{
+   g_entryTime = 0;
+   g_buyStopTicket = 0;
+   g_sellStopTicket = 0;
+   g_initialStretch = 0;
 }
 //+------------------------------------------------------------------+
