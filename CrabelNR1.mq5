@@ -87,9 +87,12 @@ void OnTick()
    // Check and manage existing positions
    ManageOpenPositions();
 
-   // Check if we can open new trade
-   if(PositionsTotal() > 0)
+   // Check if we can open new trade (only count our positions)
+   if(CountOwnPositions() > 0)
       return;
+
+   // Delete old pending orders before checking for new signal
+   DeletePendingOrders();
 
    // Check for Narrow Range pattern
    if(IsNarrowRange())
@@ -118,6 +121,29 @@ void CheckNewBar()
    {
       g_newBar = false;
    }
+}
+
+//+------------------------------------------------------------------+
+//| Count own positions (with our Magic Number)                       |
+//+------------------------------------------------------------------+
+int CountOwnPositions()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != inp_MagicNumber)
+         continue;
+
+      count++;
+   }
+   return count;
 }
 
 //+------------------------------------------------------------------+
