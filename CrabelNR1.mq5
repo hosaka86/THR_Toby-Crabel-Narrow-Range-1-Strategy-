@@ -91,12 +91,12 @@ void OnTick()
    if(CountOwnPositions() > 0)
       return;
 
-   // Delete old pending orders before checking for new signal
-   DeletePendingOrders();
-
    // Check for Narrow Range pattern
    if(IsNarrowRange())
    {
+      // Delete old pending orders only when we have a new signal
+      DeletePendingOrders();
+
       double stretch = CalculateStretch();
       if(stretch > 0)
       {
